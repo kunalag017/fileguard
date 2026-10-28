@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from pathlib import Path
 import hashlib
+import sqlite3
 from datetime import datetime
 import math
 
@@ -31,6 +32,48 @@ selected_file = None
 baseline_hash = None
 events = []
 verify_count = 0
+
+# ==================== DATABASE ====================
+
+DB_PATH = Path(__file__).with_name("fileguard.db")
+
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS monitored_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT UNIQUE NOT NULL,
+                file_name TEXT NOT NULL,
+                file_size INTEGER,
+                baseline_hash TEXT,
+                last_hash TEXT,
+                last_updated TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS integrity_checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL,
+                observed_hash TEXT,
+                result TEXT NOT NULL,
+                checked_at TEXT NOT NULL,
+                notes TEXT
+            )
+            """
+        )
+
+
+init_db()
 
 # ==================== VARIABLES ====================
 
@@ -65,6 +108,53 @@ def format_size(size):
     elif size < 1024**3:
         return f"{size / (1024**2):.2f} MB"
     return f"{size / (1024**3):.2f} GB"
+
+
+def save_file_record(file_path, baseline_hash_value=None, last_hash_value=None):
+    stamp = datetime.now().isoformat(timespec="seconds")
+    file_path = str(file_path)
+    path = Path(file_path)
+
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO monitored_files (
+                file_path, file_name, file_size, baseline_hash, last_hash, last_updated
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(file_path) DO UPDATE SET
+                file_name = excluded.file_name,
+                file_size = excluded.file_size,
+                baseline_hash = COALESCE(excluded.baseline_hash, monitored_files.baseline_hash),
+                last_hash = excluded.last_hash,
+                last_updated = excluded.last_updated
+            """,
+            (
+                file_path,
+                path.name,
+                path.stat().st_size if path.exists() else 0,
+                baseline_hash_value,
+                last_hash_value,
+                stamp,
+            ),
+        )
+
+
+def save_verification_record(file_path, observed_hash, result, notes):
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO integrity_checks (
+                file_path, observed_hash, result, checked_at, notes
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(file_path),
+                observed_hash,
+                result,
+                datetime.now().isoformat(timespec="seconds"),
+                notes,
+            ),
+        )
 
 
 # ==================== ACTIVITY LOG ====================
@@ -149,7 +239,10 @@ def choose_file():
         selected_path_var.set(str(selected_file))
         name_var.set(selected_file.name)
         size_var.set(format_size(selected_file.stat().st_size))
-        current_hash_var.set(file_hash(selected_file))
+        current_hash_value = file_hash(selected_file)
+        current_hash_var.set(current_hash_value)
+
+        save_file_record(selected_file, last_hash_value=current_hash_value)
 
         status_var.set("FILE SELECTED")
         status_detail_var.set(
@@ -179,6 +272,7 @@ def register_baseline():
     try:
         baseline_hash = file_hash(selected_file)
         current_hash_var.set(baseline_hash)
+        save_file_record(selected_file, baseline_hash_value=baseline_hash, last_hash_value=baseline_hash)
 
         status_var.set("BASELINE REGISTERED")
         status_detail_var.set(
@@ -221,6 +315,12 @@ def verify_integrity():
 
     try:
         if not selected_file.exists():
+            save_verification_record(
+                selected_file,
+                None,
+                "missing",
+                "The selected file cannot be found at its original path."
+            )
             status_var.set("FILE MISSING")
             status_detail_var.set(
                 "The selected file cannot be found at its original path."
@@ -235,8 +335,15 @@ def verify_integrity():
 
         new_hash = file_hash(selected_file)
         current_hash_var.set(new_hash)
+        save_file_record(selected_file, baseline_hash_value=baseline_hash, last_hash_value=new_hash)
 
         if new_hash == baseline_hash:
+            save_verification_record(
+                selected_file,
+                new_hash,
+                "verified",
+                "Current hash matches the registered baseline."
+            )
             status_var.set("INTEGRITY VERIFIED")
             status_detail_var.set(
                 "Current hash matches the registered baseline."
@@ -249,6 +356,12 @@ def verify_integrity():
             )
 
         else:
+            save_verification_record(
+                selected_file,
+                new_hash,
+                "changed",
+                "Hash mismatch — the file contents have changed."
+            )
             status_var.set("CHANGE DETECTED")
             status_detail_var.set(
                 "Hash mismatch — the file contents have changed."
